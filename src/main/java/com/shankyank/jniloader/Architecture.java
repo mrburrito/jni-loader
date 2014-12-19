@@ -16,7 +16,9 @@ public enum Architecture {
     IA64("ia64", "Itanium", "ia64w"),
     IA64_32("ia64_32", "Itanium (32-bit mode)", "ia64n"),
     PPC("ppc", "PowerPC", "power", "powerpc", "power_pc", "power_rs"),
-    PPC64("ppc64", "PowerPC (64-bit)");
+    PPC64("ppc64", "PowerPC (64-bit)"),
+    SPARC("sparc", "SPARC"),
+    SPARCV9("sparcv9", "SPARCv9 (64-bit)");
 
     private static final Logger LOG = LoggerFactory.getLogger(Architecture.class);
 
@@ -67,7 +69,7 @@ public enum Architecture {
             }
         }
         if (architecture == null) {
-            LOG.error("Unable to determine canonical architecture for os.arch=\"{}\"", osArch);
+            LOG.warn("Unable to determine canonical architecture for os.arch=\"{}\"", osArch);
         }
         return architecture;
     }

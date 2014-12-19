@@ -1,6 +1,10 @@
 package com.shankyank.jniloader;
 
+import static com.shankyank.jniloader.Architecture.*;
+import static com.shankyank.jniloader.OperatingSystem.*;
+
 import java.io.File;
+import java.io.FileFilter;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -11,11 +15,17 @@ import java.lang.reflect.Field;
 import java.security.DigestOutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import org.apache.commons.cli.CommandLine;
@@ -38,111 +48,113 @@ import org.slf4j.LoggerFactory;
  * and library suffix used to identify the appropriate files on the current
  * platform.
  */
-public class JNILoader {
+public final class JNILoader {
     /** The class logger. */
     private static final Logger LOG = LoggerFactory.getLogger(JNILoader.class);
 
     /** The System library path property. */
     private static final String JAVA_LIBRARY_PATH = "java.library.path";
 
-    /** The canonical Operating System for the current runtime. */
-    public static final OperatingSystem OS = OperatingSystem.getSystemOS();
+    /** The set of standard JVM platforms based on the JDK8 installers. */
+    private static final List<Platform> JAVA_STANDARD_PLATFORMS = Collections.unmodifiableList(Arrays.asList(
+            new Platform(WINDOWS, X86),
+            new Platform(WINDOWS, X86_64),
+            new Platform(LINUX, X86),
+            new Platform(LINUX, X86_64),
+            new Platform(DARWIN, X86_64),
+            new Platform(SOLARIS, SPARCV9),
+            new Platform(SOLARIS, X86_64),
+            new Platform(CYGWIN, X86),
+            new Platform(CYGWIN, X86_64),
+            new Platform(MINGW, X86),
+            new Platform(MINGW, X86_64),
+            new Platform(MSYS, X86),
+            new Platform(MSYS, X86_64)
+    ));
 
-    /** The canonical Architecture for the current runtime. */
-    public static final Architecture ARCH = Architecture.getSystemArchitecture();
+    /**
+     * The map of fallback platforms. If an archive is not found for
+     * a particular platform, the fallback platform will be used.
+     */
+    private static final Map<Platform, Platform> FALLBACK_PLATFORMS = initFallbackPlatforms();
+    private static Map<Platform, Platform> initFallbackPlatforms() {
+        Map<Platform, Platform> map = new HashMap<>();
+        map.put(new Platform(CYGWIN, X86), new Platform(WINDOWS, X86));
+        map.put(new Platform(CYGWIN, X86_64), new Platform(WINDOWS, X86_64));
+        map.put(new Platform(MINGW, X86), new Platform(WINDOWS, X86));
+        map.put(new Platform(MINGW, X86_64), new Platform(WINDOWS, X86_64));
+        map.put(new Platform(MSYS, X86), new Platform(WINDOWS, X86));
+        map.put(new Platform(MSYS, X86_64), new Platform(WINDOWS, X86_64));
+        return Collections.unmodifiableMap(map);
+    }
 
-    /** The temporary directory where native libraries will be extracted. */
-    private static final File LIBRARY_PATH = initLibraryPath();
+    /** The pattern used to check for parent directory indicators in the temporary library path. */
+    private static final Pattern PARENT_DIR = Pattern.compile("(^|/)\\.\\.(/|$)");
 
-    /** The set of library names that have been initialized. */
-    private static final Set<NativeLib> EXTRACTED_LIBS = Collections.synchronizedSet(new HashSet<NativeLib>());
+    /** The system temp directory. */
+    private static final File TMP_DIR = new File(System.getProperty("java.io.tmpdir"));
+
+    /** A filter that returns only directories. */
+    private static final FileFilter DIR_FILTER = new FileFilter() {
+        @Override
+        public boolean accept(final File file) {
+            return file.isDirectory();
+        }
+    };
+
+    /** The canonical Platform for the current runtime. */
+    public static final Platform RUNTIME_PLATFORM = new Platform(getSystemOS(), getSystemArchitecture());
 
     /** The system path lock. */
     private static final Object SYS_PATH_LOCK = new Object();
 
-    /** True once the java.library.path has been updated to include the dynamic library path. */
-    private static boolean systemInitialized = false;
+    /** The platform used by this loader. */
+    private final Platform platform;
+
+    /** The temporary directory where native libraries will be extracted. */
+    private final File libraryPath;
+
+    /** The set of library names that have been initialized. */
+    private final Set<NativeLib> extractedLibs;
 
     /**
-     * @return the temporary directory where native libraries will be extracted
+     * Create a new JNILoader for the current runtime platform that
+     * extracts libraries to ${java.io.tmpdir}/jni-loader/${os}/${arch}.
      */
-    private static File initLibraryPath() {
-        File tmpDir = new File(System.getProperty("java.io.tmpdir"));
-        String path = String.format("jni-loader/%s/%s", OS.getNativeString(), ARCH.getCanonicalName());
-        return new File(tmpDir, path);
+    public JNILoader() {
+        this("", RUNTIME_PLATFORM);
     }
 
-    static void main(final String[] args) {
-        Options opts = new Options();
-        opts.addOption(OptionBuilder.withLongOpt("help").withDescription("Display this help text.").create('?'));
-        opts.addOption(OptionBuilder.withLongOpt("os").withDescription("Display canonical OS name.").create('o'));
-        opts.addOption(OptionBuilder.withLongOpt("arch").withDescription("Display canonical architecture name.").create('a'));
-        opts.addOption(OptionBuilder.withLongOpt("init").
-                withDescription("Extracts the native libraries for the current platform and updates the system library path.").
-                create('i')
-        );
-        opts.addOption(OptionBuilder.
-                withLongOpt("resource-path").
-                hasArg(true).
-                withArgName("path").
-                withDescription("The path, relative to the classpath root, containing the library bundles.").
-                create('p')
-        );
-        opts.addOption(OptionBuilder.
-                        withLongOpt("lib-name").
-                        hasArg(true).
-                        withArgName("lib_package").
-                        isRequired(true).
-                        withDescription("The base name of the library bundles. Bundles must be named ${basename}-${os}-${arch}.zip").
-                        create('l')
-        );
+    /**
+     * Create a new JNILoader for the current runtime platform that extracts
+     * libraries to ${java.io.tmpdir}/${tmpPath}/jni-loader/${os}/${arch}.
+     * @param tmpPath a subdirectory below java.io.tmpdir where native libraries will be extracted
+     */
+    public JNILoader(final String tmpPath) {
+        this(tmpPath, RUNTIME_PLATFORM);
+    }
 
-        String usage = "JNILoader -l <lib_package> [-r <path>] [-a] [-o] [-i]";
-        HelpFormatter help = new HelpFormatter();
-        help.setWidth(120);
-        CommandLine commandLine = null;
-        try {
-            commandLine = new GnuParser().parse(opts, args);
-        } catch (ParseException e) {
-            System.out.println(e.getMessage());
-            help.printHelp(usage, opts);
-            System.exit(1);
+    /**
+     * Creates a new JNILoader for the specified runtime platform that
+     * extracts libraries to ${java.io.tmpdir}/${tmpPath}/jni-loader/${os}/${arch}.
+     * @param tmpPath a subdirectory below java.io.tmpdir where native libraries will be extracted
+     * @param pform the target platform
+     */
+    protected JNILoader(final String tmpPath, final Platform pform) {
+        if (pform == null) {
+            throw new NullPointerException("Platform is required");
         }
+        platform = pform;
 
-        if (commandLine.hasOption('?')) {
-            help.printHelp(usage, opts);
-            System.exit(0);
+        // remove trailing slashes
+        String subDir = (tmpPath != null ? tmpPath.trim() : "").replaceFirst("^/*", "");
+        if (PARENT_DIR.matcher(subDir).find()) {
+            throw new IllegalArgumentException(String.format("Extraction path [%s] cannot traverse parent directories", subDir));
         }
+        String path = String.format("%s/jni-loader/%s", subDir, platform.getSubdirectory());
+        libraryPath = new File(TMP_DIR, path);
 
-        String resourcePath = commandLine.getOptionValue('r', "");
-        String libPackage = commandLine.getOptionValue('l');
-
-        NativeLib lib = null;
-        try {
-            lib = new NativeLib(resourcePath, libPackage);
-        } catch (IllegalArgumentException iae) {
-            System.out.println(iae.getMessage());
-            help.printHelp(usage, opts);
-            System.exit(1);
-        }
-
-        if (commandLine.hasOption('o')) {
-            System.out.printf("OS:   %s%n", OS.getNativeString());
-        }
-        if (commandLine.hasOption('a')) {
-            System.out.printf("Arch: %s%n", ARCH.getCanonicalName());
-        }
-        System.out.printf("Native Lib Archive: %s%n", lib.getArchivePath());
-        System.out.printf("Temp Directory:     %s%n", LIBRARY_PATH.getAbsolutePath());
-        if (commandLine.hasOption('i')) {
-            try {
-                System.out.printf("Init? %s%n", extractLibs(resourcePath, libPackage));
-            } catch (IOException ioe) {
-                System.out.printf("Error extracting native libraries [%s]: %s", lib, ioe.getMessage());
-                ioe.printStackTrace();
-                System.exit(1);
-            }
-        }
+        extractedLibs = Collections.synchronizedSet(new HashSet<NativeLib>());
     }
 
     /**
@@ -155,28 +167,65 @@ public class JNILoader {
      * @return <code>true</code> if the native libraries are successfully extracted
      * @throws IOException if the libraries cannot be extracted
      */
-    public static boolean extractLibs(final String resourcePath, final String libPackage) throws IOException {
+    public boolean extractLibs(final String resourcePath, final String libPackage) throws IOException {
         NativeLib nativeLib = new NativeLib(resourcePath, libPackage);
-        String libPath = LIBRARY_PATH.getPath();
-        synchronized (EXTRACTED_LIBS) {
-            if (!EXTRACTED_LIBS.contains(nativeLib)) {
-                LOG.info("Extracting {} native libraries to {}", nativeLib.libPackage, libPath);
-                if (!(LIBRARY_PATH.isDirectory() || LIBRARY_PATH.mkdirs())) {
+        String libPath = libraryPath.getPath();
+        synchronized (extractedLibs) {
+            if (!extractedLibs.contains(nativeLib)) {
+                LOG.info("Extracting {} native libraries from {} to {}", nativeLib.libPackage, nativeLib.getArchivePath(platform), libPath);
+                if (!(libraryPath.isDirectory() || libraryPath.mkdirs())) {
                     throw new FileNotFoundException(String.format("Unable to create library directory: %s", libPath));
                 }
                 if (verifyLibs(nativeLib)) {
                     LOG.info("{} native libraries already exist.", nativeLib.libPackage);
-                    EXTRACTED_LIBS.add(nativeLib);
+                    extractedLibs.add(nativeLib);
                 } else {
                     ZipInputStream packaged = openNativeArchive(nativeLib);
                     try {
+                        List<File> extractedFiles = new ArrayList<>();
                         for (ZipEntry entry = packaged.getNextEntry(); entry != null; entry = packaged.getNextEntry()) {
-                            LOG.debug("Extracting native library: {}/${}", libPath, entry.getName());
-                            try {
-                                FileOutputStream out = new FileOutputStream(new File(LIBRARY_PATH, entry.getName()));
-                                IOUtils.copy(new EntryStream(packaged), out);
-                            } catch (IOException ioe) {
-                                throw new IOException(String.format("Error extracting native library [%s] to %s", entry.getName(), libPath), ioe);
+                            File tmpFile = new File(libraryPath, entry.getName());
+                            if (entry.isDirectory()) {
+                                LOG.debug("Creating directory: {}", tmpFile.getPath());
+                                if (!(tmpFile.isDirectory() || tmpFile.mkdirs())) {
+                                    LOG.error("Unable to create directory {}", tmpFile.getPath());
+                                    return false;
+                                }
+                            } else {
+                                LOG.debug("Extracting native library: {}", tmpFile.getPath());
+                                try {
+                                    FileOutputStream out = new FileOutputStream(tmpFile);
+                                    IOUtils.copy(new EntryStream(packaged), out);
+                                    extractedFiles.add(tmpFile);
+                                } catch (IOException ioe) {
+                                    throw new IOException(String.format("Error extracting native library [%s] to %s", entry.getName(), libPath), ioe);
+                                }
+                            }
+                        }
+                        // if running on OS X, ensure both .dylib and .jnilib files exist
+                        // Java 6 expects .jnilib, Java 7+ expects .dylib
+                        if (platform.getOperatingSystem() == DARWIN) {
+                            for (File lib : extractedFiles) {
+                                String altExt;
+                                if (lib.getName().endsWith(".dylib")) {
+                                    altExt = ".jnilib";
+                                } else if (lib.getName().endsWith(".jnilib")) {
+                                    altExt = ".dylib";
+                                } else {
+                                    // skip all non-library files in the archive
+                                    continue;
+                                }
+                                File target = new File(lib.getParentFile(), lib.getName().replaceAll("\\.(dylib|jnilib)$", altExt));
+                                if (!target.exists()) {
+                                    LOG.info("[{}] (OS X) Copying {} to {}", libPackage, lib.getName(), target.getName());
+                                    IOUtils.copy(new FileInputStream(lib), new FileOutputStream(target));
+                                    String srcMd5 = md5sum(new FileInputStream(lib));
+                                    String destMd5 = md5sum(new FileInputStream(target));
+                                    if (!srcMd5.equals(destMd5)) {
+                                        LOG.error("[{}] Error copying {} to {}. Bad checksum", libPackage, lib.getName(), target.getName());
+                                        throw new IOException(String.format("Error copying %s to %s. Bad checksum.", lib.getName(), target.getName()));
+                                    }
+                                }
                             }
                         }
                     } finally {
@@ -188,7 +237,7 @@ public class JNILoader {
                 }
             }
         }
-        return initSystemPath();
+        return updateSystemPath();
     }
 
     /**
@@ -197,40 +246,63 @@ public class JNILoader {
      * @return <code>true</code> if the system path has been successfully updated
      * @throws IOException if an error occurs updating the path
      */
-    public static boolean initSystemPath() throws IOException {
+    private boolean updateSystemPath() throws IOException {
+        Set<File> libDirs = buildLibTree(libraryPath, new TreeSet<File>());
         synchronized (SYS_PATH_LOCK) {
-            if (!systemInitialized) {
-                String jlp = System.getProperty(JAVA_LIBRARY_PATH);
-                if (jlp == null) {
-                    jlp = "";
-                }
-                List<String> libPaths = Arrays.asList(jlp.split(File.pathSeparator));
-                boolean found = false;
-                for (String path : libPaths) {
-                    if (LIBRARY_PATH.getCanonicalPath().equals(new File(path).getCanonicalPath())) {
-                        found = true;
-                        break;
+            String javaLibPath = System.getProperty(JAVA_LIBRARY_PATH);
+            if (javaLibPath == null) {
+                javaLibPath = "";
+            }
+            List<String> sysPaths = Arrays.asList(javaLibPath.split(File.pathSeparator));
+            for (String path : sysPaths) {
+                String cPath = new File(path).getCanonicalPath();
+                for (Iterator<File> libIter = libDirs.iterator(); libIter.hasNext();) {
+                    File libDir = libIter.next();
+                    if (libDir.getCanonicalPath().equals(cPath)) {
+                        libIter.remove();
                     }
                 }
-                if (!found) {
-                    String newPath = String.format("%s%s%s", jlp, !jlp.isEmpty() ? File.pathSeparator : "", LIBRARY_PATH.getCanonicalPath());
-                    LOG.info("Updating java.library.path: {}", newPath);
-                    System.setProperty(JAVA_LIBRARY_PATH, newPath);
+            }
+            LOG.debug("Adding {} directories to java.library.path", libDirs.size());
+            if (!libDirs.isEmpty()) {
+                StringBuilder pathBuilder = new StringBuilder(javaLibPath);
+                for (File libDir : libDirs) {
+                    if (pathBuilder.length() > 0) {
+                        pathBuilder.append(File.pathSeparator);
+                    }
+                    pathBuilder.append(libDir.getCanonicalPath());
+                }
+                LOG.info("Updating java.library.path: {}", pathBuilder);
+                System.setProperty(JAVA_LIBRARY_PATH, pathBuilder.toString());
 
-                    try {
-                        Field fieldSysPath = ClassLoader.class.getDeclaredField("sys_paths");
-                        fieldSysPath.setAccessible(true);
-                        fieldSysPath.set(null, null);
-                    } catch (IllegalAccessException | NoSuchFieldException e) {
-                        throw new IllegalStateException("Unable to clear system path cache", e);
-                    }
+                try {
+                    Field fieldSysPath = ClassLoader.class.getDeclaredField("sys_paths");
+                    fieldSysPath.setAccessible(true);
+                    fieldSysPath.set(null, null);
+                } catch (IllegalAccessException | NoSuchFieldException e) {
+                    throw new IllegalStateException("Unable to clear system path cache", e);
                 }
-                LOG.info("java.library.path: ${System.getProperty('java.library.path')}");
-                systemInitialized = true;
+            }
+            LOG.debug("java.library.path: {}", System.getProperty(JAVA_LIBRARY_PATH));
+        }
+        return true;
+    }
+
+    /**
+     * Builds a depth-first list of all subdirectories of the
+     * library extraction path for this loader.
+     * @param root the root of the current directory tree
+     * @param tree the set of subdirectories
+     * @throws IOException if errors occur identifying the canonical directories
+     */
+    private Set<File> buildLibTree(final File root, final Set<File> tree) throws IOException {
+        if (root.isDirectory()) {
+            tree.add(root.getCanonicalFile());
+            for (File dir : root.listFiles(DIR_FILTER)) {
+                buildLibTree(dir, tree);
             }
         }
-        LOG.debug("java.library.path: {}", System.getProperty(JAVA_LIBRARY_PATH));
-        return systemInitialized;
+        return tree;
     }
 
     /**
@@ -239,25 +311,31 @@ public class JNILoader {
      * @return true if all native libraries have been successfully extracted
      * @throws IOException if errors occur verifying the libraries
      */
-    private static boolean verifyLibs(final NativeLib nativeLib) throws IOException {
+    private boolean verifyLibs(final NativeLib nativeLib) throws IOException {
         ZipInputStream packaged = openNativeArchive(nativeLib);
         try {
             for (ZipEntry entry = packaged.getNextEntry(); entry != null; entry = packaged.getNextEntry()) {
-                File extractedFile = new File(LIBRARY_PATH, entry.getName());
-                if (!extractedFile.isFile()) {
-                    LOG.warn("{} was not extracted", extractedFile.getPath());
-                    return false;
-                }
+                File extractedFile = new File(libraryPath, entry.getName());
+                if (entry.isDirectory()) {
+                    if (!extractedFile.isDirectory()) {
+                        LOG.warn("[{}] missing directory: {}", nativeLib.libPackage, entry.getName());
+                    }
+                } else {
+                    if (!extractedFile.isFile()) {
+                        LOG.warn("[{}] missing file: {}", nativeLib.libPackage, entry.getName());
+                        return false;
+                    }
 
-                String packagedMd5 = md5sum(new EntryStream(packaged));
-                String extractedMd5 = md5sum(new FileInputStream(extractedFile));
+                    String packagedMd5 = md5sum(new EntryStream(packaged));
+                    String extractedMd5 = md5sum(new FileInputStream(extractedFile));
 
-                LOG.debug("{} (packaged):  {}", entry.getName(), packagedMd5);
-                LOG.debug("{} (extracted): {}", entry.getName(), extractedMd5);
+                    LOG.debug("[{}] {} (packaged):  {}", nativeLib.libPackage, entry.getName(), packagedMd5);
+                    LOG.debug("[{}] {} (extracted): {}", nativeLib.libPackage, entry.getName(), extractedMd5);
 
-                if (!packagedMd5.equals(extractedMd5)) {
-                    LOG.warn("Bad checksum for {}", extractedFile.getPath());
-                    return false;
+                    if (!packagedMd5.equals(extractedMd5)) {
+                        LOG.warn("[{}] bad checksum: {}", nativeLib.libPackage, entry.getName());
+                        return false;
+                    }
                 }
             }
         } finally {
@@ -272,7 +350,7 @@ public class JNILoader {
      * @return the MD5 hash of the input
      * @throws IOException if errors occur processing the stream
      */
-    private static String md5sum(final InputStream input) throws IOException {
+    private String md5sum(final InputStream input) throws IOException {
         try {
             MessageDigest digest = MessageDigest.getInstance("MD5");
             DigestOutputStream digestStream = new DigestOutputStream(new SinkOutputStream(), digest);
@@ -295,14 +373,108 @@ public class JNILoader {
      * @return a ZipFile for reading the archive
      * @throws FileNotFoundException if the library package for the runtime platform is not available
      */
-    private static ZipInputStream openNativeArchive(final NativeLib nativeLib) throws FileNotFoundException {
-        String archive = nativeLib.getArchivePath();
-        LOG.info("Extracting {} native libraries from archive {}", nativeLib.libPackage, archive);
-        InputStream nativeArchive = JNILoader.class.getResourceAsStream(archive);
+    private ZipInputStream openNativeArchive(final NativeLib nativeLib) throws FileNotFoundException {
+        InputStream nativeArchive = null;
+        // iterate over all available fallback platforms to find archive
+        for (Platform pform = platform; nativeArchive == null && pform != null; pform = FALLBACK_PLATFORMS.get(pform)) {
+            String archive = nativeLib.getArchivePath(pform);
+            LOG.debug("[{}] Opening archive {}", nativeLib.libPackage, archive);
+            nativeArchive = JNILoader.class.getResourceAsStream(archive);
+        }
         if (nativeArchive == null) {
-            throw new FileNotFoundException(String.format("Unable to find native library for %s/%s [%s]", OS.getNativeString(), ARCH.getCanonicalName(), archive));
+            throw new FileNotFoundException(String.format("Unable to find native library for %s [%s]", RUNTIME_PLATFORM.getArchiveSuffix(),
+                    nativeLib.getArchivePath(platform)));
         }
         return new ZipInputStream(nativeArchive);
+    }
+
+    public static void main(final String[] args) {
+        Options opts = new Options();
+        opts.addOption(OptionBuilder.withLongOpt("help").withDescription("Display this help text.").create('?'));
+        opts.addOption(OptionBuilder.withLongOpt("list-platforms").
+                withDescription("List the standard platforms recognized by the JNILoader. " +
+                        "Other platforms may be supported by supplying archive files in the format <basename>-<os>-<arch>.").
+                create('p'));
+        opts.addOption(OptionBuilder.withLongOpt("os").withDescription("Display canonical OS name.").create('o'));
+        opts.addOption(OptionBuilder.withLongOpt("arch").withDescription("Display canonical architecture name.").create('a'));
+        opts.addOption(OptionBuilder.withLongOpt("init").
+                        withDescription("Extracts the native libraries for the current platform and updates the system library path.").
+                        create('i')
+        );
+        opts.addOption(OptionBuilder.
+                        withLongOpt("resource-path").
+                        hasArg(true).
+                        withArgName("path").
+                        withDescription("The path, relative to the classpath root, containing the library bundles.").
+                        create('r')
+        );
+        opts.addOption(OptionBuilder.
+                        withLongOpt("lib-name").
+                        hasArg(true).
+                        withArgName("lib_package").
+                        withDescription("The base name of the library bundles. Bundles must be named ${basename}-${os}-${arch}.zip").
+                        create('l')
+        );
+
+        String usage = "JNILoader -? | -p | -l <lib_package> [-r <path>] [-a] [-o] [-i]";
+        HelpFormatter help = new HelpFormatter();
+        help.setWidth(120);
+        CommandLine commandLine = null;
+        try {
+            commandLine = new GnuParser().parse(opts, args);
+        } catch (ParseException e) {
+            System.out.println(e.getMessage());
+            help.printHelp(usage, opts);
+            System.exit(1);
+        }
+
+        if (commandLine.hasOption('?')) {
+            help.printHelp(usage, opts);
+            System.exit(0);
+        }
+
+        if (commandLine.hasOption('p')) {
+            for (Platform platform : JAVA_STANDARD_PLATFORMS) {
+                System.out.println(platform.toString());
+            }
+            System.exit(0);
+        }
+
+        if (!commandLine.hasOption('l')) {
+            System.out.println("Missing required option: -l");
+            help.printHelp(usage, opts);
+            System.exit(1);
+        }
+        String resourcePath = commandLine.getOptionValue('r', "");
+        String libPackage = commandLine.getOptionValue('l');
+
+        NativeLib lib = null;
+        try {
+            lib = new NativeLib(resourcePath, libPackage);
+        } catch (IllegalArgumentException iae) {
+            System.out.println(iae.getMessage());
+            help.printHelp(usage, opts);
+            System.exit(1);
+        }
+
+        JNILoader loader = new JNILoader();
+        if (commandLine.hasOption('o')) {
+            System.out.printf("OS:   %s%n", loader.platform.getOperatingSystem().getNativeString());
+        }
+        if (commandLine.hasOption('a')) {
+            System.out.printf("Arch: %s%n", loader.platform.getArchitecture().getCanonicalName());
+        }
+        System.out.printf("Native Lib Archive: %s%n", lib.getArchivePath(loader.platform));
+        System.out.printf("Temp Directory:     %s%n", loader.libraryPath.getAbsolutePath());
+        if (commandLine.hasOption('i')) {
+            try {
+                System.out.printf("Init? %s%n", loader.extractLibs(resourcePath, libPackage));
+            } catch (IOException ioe) {
+                System.out.printf("Error extracting native libraries [%s]: %s", lib, ioe.getMessage());
+                ioe.printStackTrace();
+                System.exit(1);
+            }
+        }
     }
 
     /**
@@ -327,8 +499,8 @@ public class JNILoader {
             libPackage = lPkg.trim();
         }
 
-        public String getArchivePath() {
-            return String.format("%s%s-%s-%s.zip", resourcePath, libPackage, OS.getNativeString(), ARCH.getCanonicalName());
+        public String getArchivePath(final Platform pform) {
+            return String.format("%s%s-%s.zip", resourcePath, libPackage, pform.getArchiveSuffix());
         }
 
         @Override
@@ -428,6 +600,77 @@ public class JNILoader {
 
         @Override
         public void write(byte[] b, int off, int len) throws IOException {
+        }
+    }
+
+    /**
+     * Container class for an OS/Architecture combination.
+     */
+    public static class Platform {
+        private final OperatingSystem operatingSystem;
+        private final Architecture architecture;
+
+        /**
+         * Create a new platform.
+         * @param os the operating system
+         * @param arch the architecture
+         */
+        public Platform(final OperatingSystem os, final Architecture arch) {
+            this.operatingSystem = os;
+            this.architecture = arch;
+        }
+
+        /**
+         * @return the operating system of this platform
+         */
+        public OperatingSystem getOperatingSystem() {
+            return operatingSystem;
+        }
+
+        /**
+         * @return the architecture of this platform
+         */
+        public Architecture getArchitecture() {
+            return architecture;
+        }
+
+        /**
+         * @return the archive suffix for this platform: [os]-[arch]
+         */
+        private String getArchiveSuffix() {
+            return String.format("%s-%s", operatingSystem.getNativeString(), architecture.getCanonicalName());
+        }
+
+        /**
+         * @return the subdirectory for this platform: [os]/[arch]
+         */
+        private String getSubdirectory() {
+            return String.format("%s/%s", operatingSystem.getNativeString(), architecture.getCanonicalName());
+        }
+
+        @Override
+        public String toString() {
+            return getArchiveSuffix();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            Platform platform = (Platform) o;
+
+            if (architecture != platform.architecture) return false;
+            if (operatingSystem != platform.operatingSystem) return false;
+
+            return true;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = operatingSystem.hashCode();
+            result = 31 * result + architecture.hashCode();
+            return result;
         }
     }
 }
