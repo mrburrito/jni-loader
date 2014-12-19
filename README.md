@@ -127,3 +127,23 @@ the current architecture and attempt to use those libraries instead.
   <version>0.1</version>
 </dependency>
 ```
+
+## Command Line Utility
+
+The `JNILoader` can be run as a command line utility to display the current
+platform, test bundled library extraction or list the standard platforms
+described above.
+
+#### Usage
+```
+usage: JNILoader -? | -p | -l <lib_package> [-r <path>] [-a] [-o] [-i]
+ -?,--help                     Display this help text.
+ -a,--arch                     Display canonical architecture name.
+ -i,--init                     Extracts the native libraries for the current platform and updates the system library
+                               path.
+ -l,--lib-name <lib_package>   The base name of the library bundles. Bundles must be named ${basename}-${os}-${arch}.zip
+ -o,--os                       Display canonical OS name.
+ -p,--list-platforms           List the standard platforms recognized by the JNILoader. Other platforms may be supported
+                               by supplying archive files in the format <basename>-<os>-<arch>.
+ -r,--resource-path <path>     The path, relative to the classpath root, containing the library bundles.
+```
